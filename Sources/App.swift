@@ -50,6 +50,18 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
         if loaded.1 > 0 { alert("읽을 수 없는 녹화 \(loaded.1)개를 건너뛰었습니다.", "원본 파일은 그대로 보관했습니다.") }
         if !listenAllowed || !postAllowed { showPermissions() }
+        else { showAppMenu() }
+    }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { showAppMenu() }
+        return true
+    }
+    func showAppMenu() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            NSApp.activate(ignoringOtherApps: true)
+            self.status.button?.performClick(nil)
+        }
     }
     func applicationWillTerminate(_ notification: Notification) { stopEverything(); hotKeys.forEach { UnregisterEventHotKey($0) } }
     func menuWillOpen(_ menu: NSMenu) { rebuildMenu() }
