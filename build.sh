@@ -12,12 +12,12 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>클릭 녹화기</string>
 <key>CFBundleExecutable</key><string>ClickRecorder</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.0</string>
-<key>CFBundleVersion</key><string>1</string>
+<key>CFBundleShortVersionString</key><string>1.1</string>
+<key>CFBundleVersion</key><string>2</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
-<key>NSInputMonitoringUsageDescription</key><string>다른 앱에서 클릭한 좌표와 시간을 녹화합니다.</string>
+<key>NSInputMonitoringUsageDescription</key><string>다른 앱에서 클릭한 좌표와 키보드 입력 및 시간을 녹화합니다.</string>
 </dict></plist>
 PLIST
 codesign --force --sign - --identifier local.tei.ClickRecorder "$APP"

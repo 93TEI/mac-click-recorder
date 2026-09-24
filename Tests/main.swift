@@ -32,3 +32,43 @@ ticket.cancel(); check(!ticket.accepts(generation), "cancel stale callback")
 check(ticket.accepts(ticket.generation), "new playback")
 try store.delete(recording.id); check(store.load().0.isEmpty, "delete")
 print("PASS: persistence, timing, coordinates, double click, validation, corruption, cancellation, deletion")
+
+let command: UInt64 = 1 << 20
+var capture = KeyboardCapture()
+capture.append(KeyInput(time: 0.1, code: 0, isDown: false, flags: 0)) // orphan up
+capture.append(KeyInput(time: 0.2, code: 0, isDown: true, flags: command))
+capture.append(KeyInput(time: 0.3, code: 0, isDown: true, flags: command, isRepeat: true))
+capture.append(KeyInput(time: 0.4, code: 0, isDown: false, flags: command))
+capture.append(KeyInput(time: 0.7, code: 36, isDown: true, flags: 0)) // held at stop
+let keys = capture.finish(at: 2)
+check(keys.count == 5 && keys.last?.isDown == false && keys.last?.time == 2, "orphan suppression and held key release")
+var mixed = Recording(version: 2, name: "키보드", duration: 3, screens: [screen], clicks: recording.clicks, keys: keys)
+try mixed.validate()
+try store.save(mixed)
+let restored = store.load().0.first!
+check(restored.keys?.count == 5 && restored.keys?[0].flags == command, "keyboard persistence")
+let timeline = playbackEvents(mixed)
+check(timeline.map { $0.time } == [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 1, 1.1, 2], "mixed timeline ordering")
+check(timeline[1].key?.isRepeat == true && timeline[3].click != nil, "mixed event dispatch")
+mixed.clicks = []
+try mixed.validate()
+check(playbackEvents(mixed).count == 5, "keyboard only recording")
+mixed.keys?.removeLast()
+check((try? mixed.validate()) == nil, "reject unbalanced keyboard")
+mixed.keys = [KeyInput(time: 0.2, code: 0, isDown: true, flags: 0, isRepeat: true)]
+check((try? mixed.validate()) == nil, "reject orphan repeat")
+mixed.keys = [KeyInput(time: 0.2, code: 0, isDown: false, flags: 0)]
+check((try? mixed.validate()) == nil, "reject orphan key release")
+let controlChord: UInt64 = (1 << 18) | (1 << 19) | (1 << 20)
+check(isControlShortcut(code: 15, flags: controlChord, shortcutCodes: [15, 35, 53]), "exclude app shortcut")
+check(!isControlShortcut(code: 0, flags: command, shortcutCodes: [15, 35, 53]), "keep app keyboard command")
+check(!isControlShortcut(code: 15, flags: command, shortcutCodes: [15, 35, 53]), "keep ordinary command R")
+let legacyData = try JSONEncoder().encode(recording)
+let legacy = try JSONDecoder().decode(Recording.self, from: legacyData)
+try legacy.validate()
+check(legacy.version == 1 && legacy.keys == nil, "legacy click recording compatibility")
+var flagged = recording.clicks[0]; flagged.flags = command
+let flaggedRecording = Recording(version: 2, name: "보조키 클릭", duration: 3, screens: [screen], clicks: [flagged])
+try flaggedRecording.validate()
+check(playbackEvents(flaggedRecording)[0].click?.flags == command, "modifier click")
+print("PASS: keyboard persistence, repeats, releases, mixed timeline, keyboard-only, legacy compatibility, control shortcut exclusion, modifier click")

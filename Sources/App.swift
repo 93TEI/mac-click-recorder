@@ -24,6 +24,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var clicks: [Click] = []
     var pendingClick: Click?
     var excluded = 0
+    var keyboard = KeyboardCapture()
+    var heldPlaybackKeys: Set<UInt16> = []
+    var playbackModifiers: UInt64 = 0
+    let playbackSource = CGEventSource(stateID: .privateState)
     var pressed: Click?
     var hotKeys: [EventHotKeyRef] = []
     var settingsWindow: NSWindow?
@@ -84,7 +88,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         if recordings.isEmpty { menu.addItem(item("저장된 녹화 없음", nil, enabled: false)) }
         for recording in recordings {
-            let row = item("\(recording.name) · \(recording.clicks.count)클릭 · \(Int(ceil(recording.duration)))초", #selector(selectRecording(_:)), enabled: mode == .idle)
+            let row = item("\(recording.name) · \(recording.clicks.count)클릭 / \((recording.keys ?? []).filter { $0.isDown && !$0.isRepeat }.count)키 · \(Int(ceil(recording.duration)))초", #selector(selectRecording(_:)), enabled: mode == .idle)
             row.representedObject = recording.id.uuidString
             row.state = recording.id == selected ? .on : .off
             menu.addItem(row)
@@ -117,6 +121,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if mode == .recording { finishRecording(); return }
         if mode == .countdown { stopEverything(); return }
         guard mode == .idle, listenAllowed, hotKeyOK else { return }
+        guard !IsSecureEventInputEnabled() else { alert("보안 입력이 활성화되어 있습니다.", "암호 입력을 종료한 후 녹화를 시작해 주세요."); return }
         guard layouts().count == 1 else { alert("한 화면에서 녹화해 주세요.", "첫 버전은 활성 모니터 한 개를 지원합니다."); return }
         mode = .countdown; status.button?.title = "3"; rebuildMenu()
         var remaining = 3
@@ -128,9 +133,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
     func beginRecording() {
-        clicks = []; pendingClick = nil; excluded = 0; recordingScreens = layouts()
+        clicks = []; keyboard = KeyboardCapture(); pendingClick = nil; excluded = 0; recordingScreens = layouts()
         guard recordingScreens.count == 1 else { stopEverything(); return }
-        let types: [CGEventType] = [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .leftMouseDragged, .rightMouseDragged, .scrollWheel, .otherMouseDown]
+        let types: [CGEventType] = [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .leftMouseDragged, .rightMouseDragged, .scrollWheel, .otherMouseDown, .keyDown, .keyUp]
         let mask = types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
         tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly, eventsOfInterest: mask, callback: { _, type, event, info in
             guard let info else { return Unmanaged.passUnretained(event) }
@@ -150,6 +155,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async { [weak self] in self?.finishRecording(); self?.alert("입력 감시가 중단되어 녹화를 종료했습니다.") }; return
         }
         guard mode == .recording, event.getIntegerValueField(.eventSourceUserData) != ownTag else { return }
+        if type == .keyDown || type == .keyUp {
+            let code = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+            let shortcuts = keyNames().compactMap { availableKeys[$0].map(UInt16.init) }
+            if isControlShortcut(code: code, flags: event.flags.rawValue, shortcutCodes: shortcuts) { return }
+            // Do not include input into this app's settings or name dialogs.
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
+            keyboard.append(KeyInput(time: min(180, now - recordingStart), code: code, isDown: type == .keyDown,
+                                     flags: event.flags.rawValue, isRepeat: event.getIntegerValueField(.keyboardEventAutorepeat) != 0))
+            return
+        }
         if type == .scrollWheel || type == .otherMouseDown { excluded += 1; return }
         if type == .leftMouseDragged || type == .rightMouseDragged {
             if pendingClick != nil { excluded += 1; pendingClick = nil }; return
@@ -157,15 +172,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let elapsed = min(180, now - recordingStart)
         if type == .leftMouseDown || type == .rightMouseDown {
             if pendingClick != nil { excluded += 1; pendingClick = nil; return }
-            let modifiers: CGEventFlags = [.maskCommand, .maskShift, .maskAlternate, .maskControl]
-            guard event.flags.intersection(modifiers).isEmpty else { excluded += 1; return }
             guard event.getIntegerValueField(.eventTargetUnixProcessID) != Int64(ProcessInfo.processInfo.processIdentifier) else { return }
             // The status item's menu-bar click belongs to this app too.
             if let window = status.button?.window, let screen = NSScreen.screens.first {
                 let p = NSPoint(x: event.location.x, y: screen.frame.maxY - event.location.y)
                 if window.frame.contains(p) { return }
             }
-            pendingClick = Click(down: elapsed, up: elapsed, x: event.location.x, y: event.location.y, button: type == .leftMouseDown ? 0 : 1, count: max(1, min(3, Int(event.getIntegerValueField(.mouseEventClickState)))))
+            pendingClick = Click(down: elapsed, up: elapsed, x: event.location.x, y: event.location.y, button: type == .leftMouseDown ? 0 : 1, count: max(1, min(3, Int(event.getIntegerValueField(.mouseEventClickState)))), flags: event.flags.rawValue)
         } else if var click = pendingClick {
             guard (type == .leftMouseUp && click.button == 0) || (type == .rightMouseUp && click.button == 1) else { return }
             click.up = elapsed; clicks.append(click); pendingClick = nil
@@ -181,14 +194,15 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let duration = min(180, now - recordingStart)
         if pendingClick != nil { excluded += 1 }
         removeTap(); timer?.invalidate(); timer = nil; pendingClick = nil; mode = .idle; status.button?.title = "◉"
-        if !clicks.isEmpty {
+        let keys = keyboard.finish(at: duration)
+        if !clicks.isEmpty || !keys.isEmpty {
             let formatter = DateFormatter(); formatter.dateFormat = "yyyy-MM-dd HH.mm.ss"
-            let recording = Recording(name: formatter.string(from: Date()), duration: duration, screens: recordingScreens, clicks: clicks)
+            let recording = Recording(version: 2, name: formatter.string(from: Date()), duration: duration, screens: recordingScreens, clicks: clicks, keys: keys)
             do { try store.save(recording); recordings.append(recording); selected = recording.id }
             catch { alert("녹화를 저장하지 못했습니다.", error.localizedDescription) }
         }
         rebuildMenu()
-        if excluded > 0 { alert("녹화 완료 · \(clicks.count)클릭 저장", "드래그·스크롤·보조키 클릭 등 지원하지 않거나 미완료인 동작 \(excluded)개를 제외했습니다.") }
+        if excluded > 0 { alert("녹화 완료 · \(clicks.count)클릭 저장", "드래그·스크롤 등 지원하지 않거나 미완료인 동작 \(excluded)개를 제외했습니다.") }
     }
     @objc func playFromMenu() {
         // Allow the menu to close without activating this app.
@@ -209,8 +223,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard self.postAllowed, self.layouts() == screens else { self.stopEverything(); self.alert("권한 또는 화면 구성이 변경되어 재생을 중단했습니다."); return }
             guard index < events.count else { self.stopEverything(); return }
             let event = events[index]
-            self.emit(event.click, down: event.isDown)
-            self.pressed = event.isDown ? event.click : nil
+            if let click = event.click {
+                self.syncModifiers(click.flags ?? 0)
+                self.emit(click, down: event.isDown)
+                self.pressed = event.isDown ? click : nil
+            } else if let key = event.key {
+                self.syncModifiers(key.flags)
+                self.emitKey(key)
+                if key.isDown { self.heldPlaybackKeys.insert(key.code) }
+                else { self.heldPlaybackKeys.remove(key.code) }
+            }
+            if self.heldPlaybackKeys.isEmpty && self.pressed == nil { self.syncModifiers(0) }
             self.schedule(events, index: index + 1, start: start, duration: duration, generation: generation, screens: screens)
         }
         pendingWork = work
@@ -220,17 +243,40 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let type: CGEventType = click.button == 0 ? (down ? .leftMouseDown : .leftMouseUp) : (down ? .rightMouseDown : .rightMouseUp)
         let point = CGPoint(x: click.x, y: click.y)
         CGWarpMouseCursorPosition(point)
-        let event = CGEvent(mouseEventSource: CGEventSource(stateID: .privateState), mouseType: type, mouseCursorPosition: point, mouseButton: click.button == 0 ? .left : .right)
-        event?.flags = []
+        let event = CGEvent(mouseEventSource: playbackSource, mouseType: type, mouseCursorPosition: point, mouseButton: click.button == 0 ? .left : .right)
+        event?.flags = CGEventFlags(rawValue: click.flags ?? 0)
         event?.setIntegerValueField(.mouseEventClickState, value: Int64(click.count))
         event?.setIntegerValueField(.eventSourceUserData, value: ownTag)
         event?.post(tap: .cghidEventTap)
+    }
+    func emitKey(_ key: KeyInput) {
+        let event = CGEvent(keyboardEventSource: playbackSource, virtualKey: key.code, keyDown: key.isDown)
+        event?.flags = CGEventFlags(rawValue: key.flags)
+        event?.setIntegerValueField(.keyboardEventAutorepeat, value: key.isRepeat ? 1 : 0)
+        event?.setIntegerValueField(.eventSourceUserData, value: ownTag)
+        event?.post(tap: .cghidEventTap)
+    }
+    func syncModifiers(_ flags: UInt64) {
+        // Canonical left modifier keys reproduce the recorded chord without
+        // recording the modifier-only prefix of this app's control shortcuts.
+        let modifiers: [(UInt64, UInt16)] = [(1 << 17, 56), (1 << 18, 59), (1 << 19, 58), (1 << 20, 55), (1 << 23, 63)]
+        for (mask, code) in modifiers where (playbackModifiers & mask) != (flags & mask) {
+            let down = flags & mask != 0
+            if down { playbackModifiers |= mask } else { playbackModifiers &= ~mask }
+            let event = CGEvent(keyboardEventSource: playbackSource, virtualKey: code, keyDown: down)
+            event?.type = .flagsChanged
+            event?.flags = CGEventFlags(rawValue: playbackModifiers)
+            event?.setIntegerValueField(.eventSourceUserData, value: ownTag)
+            event?.post(tap: .cghidEventTap)
+        }
     }
     @objc func stopEverything() {
         if mode == .recording { finishRecording(); return }
         ticket.cancel(); pendingWork?.cancel(); pendingWork = nil
         timer?.invalidate(); timer = nil; removeTap()
         if let pressed { emit(pressed, down: false) }; pressed = nil
+        for code in heldPlaybackKeys.sorted() { emitKey(KeyInput(time: 0, code: code, isDown: false, flags: 0)) }
+        heldPlaybackKeys.removeAll(); syncModifiers(0)
         mode = .idle; status?.button?.title = "◉"; if status != nil { rebuildMenu() }
     }
     @objc func selectRecording(_ sender: NSMenuItem) { selected = UUID(uuidString: sender.representedObject as? String ?? ""); rebuildMenu() }
@@ -256,11 +302,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         catch { self.alert("삭제하지 못했습니다.", error.localizedDescription) }
     }
     @objc func openFolder() { try? FileManager.default.createDirectory(at: store.directory, withIntermediateDirectories: true); NSWorkspace.shared.open(store.directory) }
-    @objc func help() { alert("클릭 녹화기 사용 방법", "1. 단축키로 녹화를 시작하고 3초 후 클릭하세요.\n2. 같은 단축키로 종료하면 자동 저장됩니다.\n3. 메뉴에서 녹화를 선택하세요.\n4. 대상 창의 위치·크기를 맞춘 후 재생 단축키를 누르세요.\n\n좌우·더블클릭과 시간 간격만 기록합니다. 이동 경로·드래그·스크롤·보조키 클릭은 제외합니다. 앱의 로딩 시간에 따라 결과가 달라질 수 있습니다.\n\n기본 단축키: Control+Option+Command와 R(녹화), P(재생), Esc(중지).") }
+    @objc func help() { alert("클릭 녹화기 사용 방법", "1. 단축키로 녹화를 시작하고 3초 후 클릭하세요.\n2. 같은 단축키로 종료하면 자동 저장됩니다.\n3. 메뉴에서 녹화를 선택하세요.\n4. 대상 창의 위치·크기를 맞춘 후 재생 단축키를 누르세요.\n\n좌우·더블클릭과 키보드 입력, 보조키 조합, 시간 간격을 기록합니다. 이동 경로·드래그·스크롤은 제외합니다. 재생할 때 입력 언어와 대상 창을 녹화 당시와 같게 맞춰 주세요. 앱의 로딩 시간에 따라 결과가 달라질 수 있습니다.\n\n기본 단축키: Control+Option+Command와 R(녹화), P(재생), Esc(중지).") }
     @objc func quit() { NSApp.terminate(nil) }
     @objc func showPermissions() {
         NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert(); alert.messageText = "다른 앱의 클릭을 녹화하고 재생하려면 권한이 필요합니다."
+        let alert = NSAlert(); alert.messageText = "다른 앱의 클릭과 키보드를 녹화하고 재생하려면 권한이 필요합니다."
         alert.informativeText = "입력 모니터링: \(listenAllowed ? "허용됨" : "필요")\n손쉬운 사용: \(postAllowed ? "허용됨" : "필요")\n\n시스템 설정에서 ‘클릭 녹화기’를 허용하세요. 권한 변경 후 앱을 다시 실행해야 할 수 있습니다."
         alert.addButton(withTitle: "권한 요청"); alert.addButton(withTitle: "손쉬운 사용 설정"); alert.addButton(withTitle: "입력 모니터링 설정"); alert.addButton(withTitle: "닫기")
         switch alert.runModal().rawValue {

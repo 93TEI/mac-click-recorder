@@ -1,0 +1,20 @@
+name: macOS checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test-and-build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test recording model and playback timeline
+        run: ./test.sh
+      - name: Build app
+        run: ./build.sh
+      - name: Verify app bundle
+        run: |
+          codesign --verify --deep --strict 'build/클릭 녹화기.app'
+          plutil -lint 'build/클릭 녹화기.app/Contents/Info.plist'
