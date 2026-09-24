@@ -17,6 +17,42 @@ struct Click: Codable {
     var y: Double
     var button: Int
     var count: Int
+    var flags: UInt64? = nil
+}
+
+struct KeyInput: Codable {
+    var time: Double
+    var code: UInt16
+    var isDown: Bool
+    var flags: UInt64
+    var isRepeat: Bool = false
+}
+
+// Keeps repeats, ignores orphan releases, and balances keys held at recording end.
+struct KeyboardCapture {
+    private(set) var events: [KeyInput] = []
+    private var held: Set<UInt16> = []
+    mutating func append(_ event: KeyInput) {
+        if event.isDown {
+            guard !event.isRepeat || held.contains(event.code) else { return }
+            guard event.isRepeat || !held.contains(event.code) else { return }
+            held.insert(event.code)
+        } else {
+            guard held.remove(event.code) != nil else { return }
+        }
+        events.append(event)
+    }
+    mutating func finish(at time: Double) -> [KeyInput] {
+        for code in held.sorted() { events.append(KeyInput(time: time, code: code, isDown: false, flags: 0)) }
+        held.removeAll()
+        return events
+    }
+}
+
+func isControlShortcut(code: UInt16, flags: UInt64, shortcutCodes: [UInt16]) -> Bool {
+    // CGEventFlags: Control, Option, Command. Shift may also be present.
+    let required: UInt64 = (1 << 18) | (1 << 19) | (1 << 20)
+    return flags & required == required && shortcutCodes.contains(code)
 }
 
 struct Recording: Codable {
@@ -26,10 +62,13 @@ struct Recording: Codable {
     var duration: Double
     var screens: [ScreenLayout]
     var clicks: [Click]
+    var keys: [KeyInput]? = nil
 
     func validate() throws {
-        guard version == 1, duration.isFinite, duration >= 0, duration <= 180,
-              !clicks.isEmpty, clicks.count <= 100_000, !screens.isEmpty else { throw StoreError.invalid }
+        let keys = keys ?? []
+        guard (1...2).contains(version), duration.isFinite, duration >= 0, duration <= 180,
+              !clicks.isEmpty || !keys.isEmpty, clicks.count + keys.count <= 100_000,
+              !screens.isEmpty, version == 2 || keys.isEmpty else { throw StoreError.invalid }
         for s in screens {
             guard [s.x, s.y, s.width, s.height].allSatisfy({ $0.isFinite }),
                   s.width > 0, s.height > 0, s.pixelsWide > 0, s.pixelsHigh > 0 else { throw StoreError.invalid }
@@ -43,6 +82,19 @@ struct Recording: Codable {
             else { throw StoreError.invalid }
             previous = c.up
         }
+        previous = 0
+        var held: Set<UInt16> = []
+        for key in keys {
+            guard key.time.isFinite, key.time >= previous, key.time <= duration, key.code <= 127 else { throw StoreError.invalid }
+            if key.isDown {
+                guard key.isRepeat == held.contains(key.code) else { throw StoreError.invalid }
+                held.insert(key.code)
+            } else {
+                guard !key.isRepeat, held.remove(key.code) != nil else { throw StoreError.invalid }
+            }
+            previous = key.time
+        }
+        guard held.isEmpty else { throw StoreError.invalid }
     }
 }
 
@@ -77,12 +129,17 @@ struct RecordingStore {
 
 struct PlaybackEvent {
     let time: Double
-    let click: Click
+    let click: Click?
     let isDown: Bool
+    var key: KeyInput? = nil
 }
 
 func playbackEvents(_ recording: Recording) -> [PlaybackEvent] {
-    recording.clicks.flatMap { [PlaybackEvent(time: $0.down, click: $0, isDown: true), PlaybackEvent(time: $0.up, click: $0, isDown: false)] }
+    let mouse = recording.clicks.flatMap { [PlaybackEvent(time: $0.down, click: $0, isDown: true), PlaybackEvent(time: $0.up, click: $0, isDown: false)] }
+    let keyboard = (recording.keys ?? []).map { PlaybackEvent(time: $0.time, click: nil, isDown: $0.isDown, key: $0) }
+    return (mouse + keyboard).enumerated().sorted {
+        $0.element.time == $1.element.time ? $0.offset < $1.offset : $0.element.time < $1.element.time
+    }.map(\.element)
 }
 
 // A generation invalidates every callback from an earlier playback.
