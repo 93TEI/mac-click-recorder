@@ -72,3 +72,134 @@ let flaggedRecording = Recording(version: 2, name: "보조키 클릭", duration:
 try flaggedRecording.validate()
 check(playbackEvents(flaggedRecording)[0].click?.flags == command, "modifier click")
 print("PASS: keyboard persistence, repeats, releases, mixed timeline, keyboard-only, legacy compatibility, control shortcut exclusion, modifier click")
+
+// Regression and boundary cases. Each invalid value must fail before saving/replay.
+func rejected(_ name: String, _ edit: (inout Recording) -> Void) {
+    var value = recording; edit(&value)
+    check((try? value.validate()) == nil, name)
+}
+rejected("negative duration") { $0.duration = -1 }
+rejected("nan duration") { $0.duration = .nan }
+rejected("infinite duration") { $0.duration = .infinity }
+rejected("empty input") { $0.clicks = [] }
+rejected("blank name") { $0.name = "  \n" }
+rejected("long name") { $0.name = String(repeating: "a", count: 101) }
+rejected("no screen") { $0.screens = [] }
+rejected("duplicate displays") { $0.screens.append(screen) }
+rejected("invalid width") { $0.screens[0].width = 0 }
+rejected("nan origin") { $0.screens[0].x = .nan }
+rejected("overflowing bounds") { $0.screens[0].x = .greatestFiniteMagnitude; $0.screens[0].width = .greatestFiniteMagnitude }
+rejected("invalid pixel size") { $0.screens[0].pixelsWide = -1 }
+rejected("negative time") { $0.clicks[0].down = -0.1 }
+rejected("release precedes down") { $0.clicks[0].up = 0.1 }
+rejected("overlapping clicks") { $0.clicks[1].down = 0.55 }
+rejected("right edge is exclusive") { $0.clicks[0].x = 1920 }
+rejected("bottom edge is exclusive") { $0.clicks[0].y = 1080 }
+rejected("nan position") { $0.clicks[0].x = .nan }
+rejected("unsupported mouse button") { $0.clicks[0].button = 2 }
+rejected("invalid click count") { $0.clicks[0].count = 0 }
+rejected("too many inputs") { $0.clicks = Array(repeating: Click(down: 0, up: 0, x: 0, y: 0, button: 0, count: 1), count: 100_001) }
+rejected("v1 cannot contain keyboard") { $0.keys = keys }
+for badKeys in [
+    [KeyInput(time: -1, code: 0, isDown: true, flags: 0)],
+    [KeyInput(time: .nan, code: 0, isDown: true, flags: 0)],
+    [KeyInput(time: 0, code: 128, isDown: true, flags: 0)],
+    [KeyInput(time: 0, code: 0, isDown: true, flags: 0), KeyInput(time: 4, code: 0, isDown: false, flags: 0)],
+    [KeyInput(time: 1, code: 0, isDown: true, flags: 0), KeyInput(time: 0, code: 0, isDown: false, flags: 0)],
+    [KeyInput(time: 0, code: 0, isDown: true, flags: 0), KeyInput(time: 1, code: 0, isDown: true, flags: 0)],
+    [KeyInput(time: 0, code: 0, isDown: true, flags: 0), KeyInput(time: 1, code: 0, isDown: false, flags: 0, isRepeat: true)]
+] { rejected("invalid keyboard sequence") { $0.version = 2; $0.keys = badKeys } }
+var boundary = recording
+boundary.clicks = [Click(down: 0, up: 180, x: 0, y: 0, button: 1, count: 3)]
+boundary.duration = 180
+try boundary.validate()
+
+var focused = KeyboardCapture()
+focused.record(KeyInput(time: 0, code: 0, isDown: true, flags: 0), excluded: false)
+focused.record(KeyInput(time: 1, code: 0, isDown: false, flags: command), excluded: true)
+check(focused.finish(at: 2).map { $0.time } == [0, 1], "release after focus change retained")
+var suppressed = KeyboardCapture()
+suppressed.record(KeyInput(time: 0, code: 15, isDown: true, flags: controlChord), excluded: true)
+suppressed.record(KeyInput(time: 1, code: 15, isDown: true, flags: 0, isRepeat: true), excluded: false)
+suppressed.record(KeyInput(time: 2, code: 15, isDown: false, flags: 0), excluded: false)
+check(suppressed.finish(at: 3).isEmpty, "shortcut remains suppressed until release")
+var duplicates = KeyboardCapture()
+duplicates.append(KeyInput(time: 0, code: 0, isDown: true, flags: 0, isRepeat: true))
+duplicates.append(KeyInput(time: 1, code: 0, isDown: true, flags: 0))
+duplicates.append(KeyInput(time: 2, code: 0, isDown: true, flags: 0))
+check(duplicates.finish(at: 3).count == 2, "duplicate down and orphan repeat ignored")
+check(duplicates.finish(at: 3).count == 2, "finish is idempotent")
+
+func click(_ time: Double, _ button: Int = 0) -> Click { Click(down: time, up: time, x: 100, y: 200, button: button, count: 1) }
+var mouse = MouseCapture()
+mouse.up(button: 0, time: 0)
+mouse.down(click(1), excluded: false); mouse.drag(); mouse.up(button: 0, time: 2)
+check(mouse.clicks.isEmpty, "drag excluded")
+mouse.down(click(3), excluded: false); mouse.unsupportedGesture(); mouse.up(button: 0, time: 4)
+check(mouse.clicks.isEmpty, "scroll while held cannot become click")
+mouse.down(click(5), excluded: false); mouse.down(click(5.1, 1), excluded: false)
+mouse.up(button: 0, time: 6); mouse.down(click(6.1), excluded: false)
+mouse.up(button: 1, time: 7); mouse.up(button: 0, time: 8)
+check(mouse.clicks.count == 3, "overlapping button lifetimes captured independently")
+mouse = MouseCapture()
+mouse.down(click(9), excluded: true); mouse.up(button: 0, time: 10)
+check(mouse.clicks.isEmpty, "own UI excluded")
+mouse.down(click(11, 1), excluded: false); mouse.up(button: 0, time: 11.1); mouse.up(button: 1, time: 12)
+check(mouse.clicks.count == 1 && mouse.clicks[0].button == 1 && mouse.clicks[0].up == 12, "right click and mismatched release")
+mouse.down(click(13), excluded: false); mouse.finish()
+check(mouse.pending.isEmpty && mouse.clicks.count == 1, "incomplete click discarded")
+
+// Deterministic randomized event streams must always produce valid, balanced recordings.
+var seed: UInt64 = 431
+func random(_ max: Int) -> Int { seed = seed &* 6364136223846793005 &+ 1; return Int((seed >> 32) % UInt64(max)) }
+for iteration in 0..<200 {
+    var keyboard = KeyboardCapture(); var mouse = MouseCapture()
+    for index in 0..<500 {
+        let time = Double(index) / 100
+        let code = UInt16(random(5))
+        keyboard.record(KeyInput(time: time, code: code, isDown: random(2) == 0, flags: 0, isRepeat: false), excluded: random(5) == 0)
+        switch random(5) {
+        case 0: mouse.down(click(time, random(2)), excluded: random(8) == 0)
+        case 1: mouse.up(button: random(2), time: time)
+        case 2: mouse.drag()
+        case 3: mouse.unsupportedGesture()
+        default: break
+        }
+    }
+    mouse.finish(); let keys = keyboard.finish(at: 5)
+    if !keys.isEmpty || !mouse.clicks.isEmpty {
+        let old = Recording(version: 2, name: "fuzz \(iteration)", duration: 5, screens: [screen], clicks: mouse.clicks, keys: keys)
+        let inputs = playbackEvents(old).map { event -> RecordedInput in
+            if let key = event.key { return RecordedInput(time: event.time, kind: key.isDown ? .keyDown : .keyUp, keyCode: key.code, isRepeat: key.isRepeat) }
+            let c = event.click!
+            return RecordedInput(time: event.time, kind: event.isDown ? .mouseDown : .mouseUp, x: c.x, y: c.y, button: c.button, clickCount: c.count)
+        }
+        let value = Recording(version: 3, name: "fuzz \(iteration)", duration: 5, screens: [screen], clicks: [], timeline: inputs)
+        try value.validate()
+        let times = playbackEvents(value).map(\.time)
+        check(times == times.sorted(), "randomized timeline stays ordered")
+    }
+}
+
+let mismatch = directory.appendingPathComponent(UUID().uuidString + ".json")
+try JSONEncoder().encode(recording).write(to: mismatch)
+check(store.load().1 == 2, "filename UUID mismatch rejected")
+let symlink = directory.appendingPathComponent(UUID().uuidString + ".json")
+try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: store.url(restored.id))
+check(store.load().1 == 3, "symbolic link rejected")
+let blockedDirectory = directory.appendingPathComponent("not-a-directory")
+try Data().write(to: blockedDirectory)
+let blockedStore = RecordingStore(directory: blockedDirectory)
+check(blockedStore.load().1 == 1, "unreadable directory is reported")
+check((try? blockedStore.save(recording)) == nil, "storage failure propagated")
+try store.save(recording)
+let attrs = try FileManager.default.attributesOfItem(atPath: store.url(recording.id).path)
+check((attrs[.posixPermissions] as? NSNumber)?.intValue == 0o600, "recording owner-only permissions")
+let before = try Data(contentsOf: store.url(recording.id))
+var badOverwrite = recording; badOverwrite.duration = -1
+check((try? store.save(badOverwrite)) == nil, "invalid overwrite rejected")
+let after = try Data(contentsOf: store.url(recording.id))
+check(after == before, "failed validation preserves prior file")
+print("PASS: validation boundaries, shortcut/focus transitions, mouse gestures, 200 randomized streams (100,000 steps), storage failures and permissions")
+
+try timelineTests()

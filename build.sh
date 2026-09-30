@@ -3,7 +3,7 @@ set -euo pipefail
 cd "${0:A:h}"
 mkdir -p build/'클릭 녹화기.app'/Contents/MacOS
 APP="$PWD/build/클릭 녹화기.app"
-swiftc -O -swift-version 5 -module-name ClickRecorder Sources/Model.swift Sources/App.swift -o "$APP/Contents/MacOS/ClickRecorder" -framework AppKit -framework Carbon -framework CoreGraphics
+swiftc -O -swift-version 5 -module-name ClickRecorder Sources/Model.swift Sources/Timeline.swift Sources/PlatformInput.swift Sources/App.swift -o "$APP/Contents/MacOS/ClickRecorder" -framework AppKit -framework Carbon -framework CoreGraphics
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
